@@ -5,10 +5,14 @@ import com.lauriewired.malimite.configuration.Config;
 import com.lauriewired.malimite.configuration.LibraryDefinitions;
 import com.lauriewired.malimite.database.SQLiteDBHandler;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.io.*;
+import java.sql.SQLException;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -23,13 +27,20 @@ import java.util.Map;
 import java.util.List;
 
 public class GhidraProject {
+    @FunctionalInterface
+    interface BridgeServerSocketFactory {
+        ServerSocket create(int port) throws IOException;
+    }
+
     private static final Logger LOGGER = Logger.getLogger(GhidraProject.class.getName());
     private String ghidraProjectName;
     private Config config;
     private String scriptPath;
     private SQLiteDBHandler dbHandler;
-    private static final int BASE_PORT = 8765;
+    private static final int BASE_PORT = 18765;
     private static final int MAX_PORT_ATTEMPTS = 10;
+    private static final int HEARTBEAT_TIMEOUT_MS = 600_000;  // 10 min — Ghidra must finish full analysis before post-script sends heartbeat
+    private static final int DATA_CONNECTION_TIMEOUT_MS = 600_000; // 10 min — decompiling all functions can take several minutes
     private Consumer<String> consoleOutputCallback;
 
     public GhidraProject(String infoPlistBundleExecutable, String executableFilePath, Config config, SQLiteDBHandler dbHandler, Consumer<String> consoleOutputCallback) {
@@ -37,9 +48,16 @@ public class GhidraProject {
         this.config = config;
         this.dbHandler = dbHandler;
         this.consoleOutputCallback = consoleOutputCallback;
-        // Set script path based on current directory and OS
-        String currentDir = System.getProperty("user.dir");
-        this.scriptPath = Paths.get(currentDir, "DecompilerBridge", "ghidra").toString();
+        // Set script path: try JAR location first, then current directory
+        String jarDir = getJarDirectory();
+        Path candidate = Paths.get(jarDir, "DecompilerBridge", "ghidra");
+        if (Files.isDirectory(candidate)) {
+            this.scriptPath = candidate.toString();
+        } else {
+            // Fall back to current working directory
+            String currentDir = System.getProperty("user.dir");
+            this.scriptPath = Paths.get(currentDir, "DecompilerBridge", "ghidra").toString();
+        }
 
         LOGGER.info("Initializing GhidraProject with executable: " + infoPlistBundleExecutable);
         LOGGER.info("Script path: " + scriptPath);
@@ -47,25 +65,14 @@ public class GhidraProject {
 
     public void decompileMacho(String executableFilePath, String projectDirectoryPath, Macho targetMacho, boolean dynamicFile) {
         LOGGER.info("Starting Ghidra decompilation for: " + executableFilePath);
-        
-        // Try ports until we find an available one
-        ServerSocket serverSocket = null;
-        int port = BASE_PORT;
-        int attempts = 0;
-        
-        while (attempts < MAX_PORT_ATTEMPTS && serverSocket == null) {
-            try {
-                serverSocket = new ServerSocket(port);
-                LOGGER.info("Successfully bound to port " + port);
-            } catch (IOException e) {
-                LOGGER.warning("Port " + port + " is in use, trying next port");
-                port++;
-                attempts++;
-                if (attempts >= MAX_PORT_ATTEMPTS) {
-                    throw new RuntimeException("Unable to find available port after " + MAX_PORT_ATTEMPTS + " attempts");
-                }
-            }
+
+        ServerSocket serverSocket;
+        try {
+            serverSocket = openBridgeServerSocket(BASE_PORT, MAX_PORT_ATTEMPTS);
+        } catch (IOException e) {
+            throw new RuntimeException("Unable to bind bridge server socket", e);
         }
+        int port = serverSocket.getLocalPort();
 
         try (ServerSocket finalServerSocket = serverSocket) {  // Ensure socket gets closed
             String analyzeHeadless = getAnalyzeHeadlessPath();
@@ -74,237 +81,168 @@ public class GhidraProject {
             List<String> activeLibraries = LibraryDefinitions.getActiveLibraries(config);
             String librariesArg = String.join(",", activeLibraries);
 
-            ProcessBuilder builder = new ProcessBuilder(    
+            ProcessBuilder builder = new ProcessBuilder(buildAnalyzeHeadlessCommand(
                 analyzeHeadless,
                 projectDirectoryPath,
                 this.ghidraProjectName,
-                "-import",
                 executableFilePath,
-                "-scriptPath",
                 scriptPath,
-                "-postScript",
-                "DumpClassData.java",
-                String.valueOf(port),  // Use the port we found
-                librariesArg,
-                "-enableAnalyzer", "Objective-C",
-                "-enableAnalyzer", "String Extraction",
-                "-disableAnalyzer", "Decompiler Parameter ID",
-                "-disableAnalyzer", "DWARF",
-                "-skipAnalysisPrompt",
-                "-deleteProject"
-            );
-            
-            // Redirect Ghidra's output and error streams
+                port,
+                librariesArg
+            ));
+
             builder.redirectErrorStream(true);
             Process process = builder.start();
 
-            // Read Ghidra's output in a separate thread
             Thread outputThread = new Thread(() -> {
                 try (BufferedReader ghidraOutput = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
                     String line;
                     while ((line = ghidraOutput.readLine()) != null) {
-                        final String outputLine = line;
                         if (consoleOutputCallback != null) {
-                            consoleOutputCallback.accept("Ghidra: " + outputLine);
+                            consoleOutputCallback.accept("Ghidra: " + line);
                         }
                         System.out.println("Ghidra Output: " + line);
                     }
                 } catch (IOException e) {
                     LOGGER.log(Level.SEVERE, "Error reading Ghidra output", e);
                 }
-            });
+            }, "ghidra-output-" + port);
+            outputThread.setDaemon(true);
             outputThread.start();
 
-            LOGGER.info("Starting Ghidra headless analyzer with command: " + String.join(" ", builder.command()));
-            LOGGER.info("Waiting for Ghidra script connection on port " + port);
-            
-            Socket socket = serverSocket.accept();
-            socket.setSoTimeout(60000); // 1 minute timeout for heartbeat
-            LOGGER.info("Connection established with Ghidra script");
+            logBridgeMessage("Starting Ghidra headless analyzer with command: " + String.join(" ", builder.command()));
+            logBridgeMessage("Waiting for Ghidra script heartbeat on port " + port);
 
-            try (BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()))) {
-                // Wait for heartbeat
-                String heartbeat = in.readLine();
+            try (Socket heartbeatSocket = acceptSocket(finalServerSocket, HEARTBEAT_TIMEOUT_MS, "heartbeat");
+                 BufferedReader heartbeatReader = new BufferedReader(new InputStreamReader(heartbeatSocket.getInputStream()))) {
+                heartbeatSocket.setSoTimeout(HEARTBEAT_TIMEOUT_MS);
+                logBridgeMessage("Connection established with Ghidra script");
+
+                String heartbeat = readRequiredLine(heartbeatReader, "heartbeat");
                 if (!"HEARTBEAT".equals(heartbeat)) {
-                    throw new RuntimeException("Did not receive heartbeat from Ghidra script");
+                    throw new IOException("Unexpected heartbeat message from Ghidra script: " + heartbeat);
                 }
-                LOGGER.info("Received heartbeat from Ghidra script");
-                
-                // Close the initial heartbeat connection
-                socket.close();
-                
-                // Accept the new connection for actual data transfer
-                socket = serverSocket.accept();
-                socket.setSoTimeout(0); // No timeout for data transfer
+                logBridgeMessage("Received heartbeat from Ghidra script");
             }
 
-            // Start new try-with-resources for data transfer
-            try (BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()))) {
-                // Continue with the rest of the connection handling
-                String connectionConfirmation = in.readLine();
+            logBridgeMessage("Waiting for Ghidra data connection on port " + port);
+
+            try (Socket dataSocket = acceptSocket(finalServerSocket, DATA_CONNECTION_TIMEOUT_MS, "data");
+                 BufferedReader in = new BufferedReader(new InputStreamReader(dataSocket.getInputStream()))) {
+                dataSocket.setSoTimeout(0);
+
+                String connectionConfirmation = readRequiredLine(in, "connection confirmation");
                 if (!"CONNECTED".equals(connectionConfirmation)) {
-                    throw new RuntimeException("Did not receive proper connection confirmation from Ghidra script");
+                    throw new IOException("Unexpected connection confirmation from Ghidra script: " + connectionConfirmation);
                 }
-                LOGGER.info("Ghidra script confirmed connection, beginning analysis");
+                logBridgeMessage("Ghidra script confirmed connection, beginning analysis");
 
-                LOGGER.info("Reading class data from Ghidra script");
-                String line;
-                StringBuilder classDataBuilder = new StringBuilder();
-                while (!(line = in.readLine()).equals("END_CLASS_DATA")) {
-                    classDataBuilder.append(line).append("\n");
-                }
+                String classDataPayload = readDelimitedBlock(in, "END_CLASS_DATA", "class data");
+                String machoDataPayload = readDelimitedBlock(in, "END_MACHO_DATA", "Mach-O data");
+                String functionDataPayload = readDelimitedBlock(in, "END_DATA", "function data");
+                String stringDataPayload = readDelimitedBlock(in, "END_STRING_DATA", "string data");
 
-                LOGGER.info("Reading Mach-O data from Ghidra script");
-                StringBuilder machoDataBuilder = new StringBuilder();
-                while (!(line = in.readLine()).equals("END_MACHO_DATA")) {
-                    machoDataBuilder.append(line).append("\n");
-                }
+                JSONArray classData = new JSONArray(classDataPayload);
+                JSONObject machoData = new JSONObject(machoDataPayload);
+                JSONArray functionData = new JSONArray(functionDataPayload);
+                JSONArray stringData = new JSONArray(stringDataPayload);
 
-                LOGGER.info("Reading function decompilation data from Ghidra script");
-                StringBuilder functionDataBuilder = new StringBuilder();
-                while (!(line = in.readLine()).equals("END_DATA")) {
-                    functionDataBuilder.append(line).append("\n");
-                }
-
-                // Add this new section to process strings
-                LOGGER.info("Reading string data from Ghidra script");
-                StringBuilder stringDataBuilder = new StringBuilder();
-                while (!(line = in.readLine()).equals("END_STRING_DATA")) {
-                    stringDataBuilder.append(line).append("\n");
+                logBridgeMessage(
+                    "Processing " + classData.length() + " classes, "
+                        + functionData.length() + " functions, "
+                        + stringData.length() + " strings from Ghidra analysis"
+                );
+                LOGGER.info("Received Mach-O metadata for " + machoData.length() + " segments");
+                if (classData.length() == 0 && functionData.length() == 0 && stringData.length() == 0) {
+                    logBridgeMessage("Ghidra bridge received empty payloads. Check analyzer configuration and script output.");
                 }
 
-                // Process and store the received data
-                JSONArray classData = new JSONArray(classDataBuilder.toString());
-                JSONArray functionData = new JSONArray(functionDataBuilder.toString());
-                JSONArray stringData = new JSONArray(stringDataBuilder.toString());
-                LOGGER.info("Processing " + classData.length() + " classes and " + functionData.length() + " functions from Ghidra analysis");
-                
-                // Process both class and function data together
-                Map<String, JSONArray> classToFunctions = new HashMap<>();
+                Map<String, JSONArray> classToFunctions = extractClassFunctions(classData);
                 Map<String, String> classNameMapping = new HashMap<>();
 
-                // First pass: organize functions by class and demangle class names
-                // Use parallelStream to process functionData in parallel
                 ArrayList<SQLiteDBHandler.DecompilationResult> decompilationResults = new ArrayList<>();
-                ArrayList<SyntaxParser> syntaxParsers = new ArrayList<>();
+                final int totalFunctions = functionData.length();
+                final int BATCH_SIZE = 500;
 
-                functionData.toList().parallelStream().forEach(obj -> {
-                    JSONObject functionObj = new JSONObject((Map<?, ?>) obj);
+                logBridgeMessage("Processing " + totalFunctions + " functions...");
+
+                for (int i = 0; i < totalFunctions; i++) {
+                    JSONObject functionObj = functionData.getJSONObject(i);
                     String functionName = functionObj.getString("FunctionName");
                     String className = functionObj.getString("ClassName");
                     String decompiledCode = functionObj.getString("DecompiledCode");
 
-                    // For Swift binaries, get the class name from the function name
                     if (!config.isMac() && targetMacho.isSwift() && functionName.startsWith("_$s")) {
                         DemangleSwift.DemangledName demangledName = DemangleSwift.demangleSwiftName(functionName);
                         if (demangledName != null) {
-                            LOGGER.info("Demangled function name from " + functionName + " to " + demangledName.fullMethodName);
                             className = demangledName.className;
                             functionName = demangledName.fullMethodName;
-                            LOGGER.info("Using class name from demangled function: " + className);
-                        } else {
-                            LOGGER.warning("Failed to demangle Swift symbol: " + functionName);
                         }
                     }
 
-                    // Replace empty class name with "Global" after demangling
                     if (className == null || className.trim().isEmpty()) {
                         className = "Global";
                     }
 
-                    // Check if this class should be treated as a library
                     final String finalClassName = className;
                     boolean isLibrary = activeLibraries.stream()
                             .anyMatch(library -> finalClassName.startsWith(library));
 
                     if (!isLibrary) {
-                        // Process and store the decompiled code only for non-library classes
-                        decompiledCode = decompiledCode.replaceAll("/\\*.*\\*/", "");  // Remove Ghidra comments
+                        decompiledCode = decompiledCode.replaceAll("/\\*.*\\*/", "");
 
-                        // Add headers with the correct class name
                         if (!decompiledCode.trim().startsWith("// Class:") && !decompiledCode.trim().startsWith("// Function:")) {
-                            StringBuilder contentBuilder = new StringBuilder();
-                            contentBuilder.append("// Class: ").append(className).append("\n");
-                            contentBuilder.append("// Function: ").append(functionName).append("\n\n");
-                            contentBuilder.append(decompiledCode.trim());
-                            decompiledCode = contentBuilder.toString();
+                            decompiledCode = "// Class: " + className + "\n// Function: " + functionName + "\n\n" + decompiledCode.trim();
                         }
 
-                        String message = "Storing decompilation for " + className + "::" + functionName;
-                        LOGGER.info(message);
-                        if (consoleOutputCallback != null) {
-                            consoleOutputCallback.accept(message);
-                        }
+                        decompilationResults.add(new SQLiteDBHandler.DecompilationResult(
+                            functionName, className, decompiledCode, targetMacho.getMachoExecutableName()));
 
-                        // Store function decompilation with the correct class name and executable name
-                        synchronized (decompilationResults) {
-                            decompilationResults.add(new SQLiteDBHandler.DecompilationResult(functionName, className, decompiledCode, targetMacho.getMachoExecutableName()));
-                        }
-                        if (decompiledCode != null && !decompiledCode.trim().isEmpty()) {
-                            // Parse the decompiled code for syntax information
-                            SyntaxParser syntaxParser = new SyntaxParser(targetMacho.getMachoExecutableName());
-                            syntaxParser.setContext(functionName, className);
-                            syntaxParser.collectCrossReferences(decompiledCode);
-                            synchronized (syntaxParsers) {
-                                syntaxParsers.add(syntaxParser);
-                            }
-                        }
-
-                        // Add to class functions map
-                        synchronized (classToFunctions) {
-                            classToFunctions.computeIfAbsent(className, k -> new JSONArray())
-                                            .put(functionName);
-                        }
+                        JSONArray functions = classToFunctions.computeIfAbsent(className, key -> new JSONArray());
+                        appendIfMissing(functions, functionName);
                     } else {
-                        // For library functions, combine class and function names and store under "Libraries"
                         String libraryFunctionName = className + "::" + functionName;
-                        String message = "Storing library function: " + libraryFunctionName;
-                        LOGGER.info(message);
-                        if (consoleOutputCallback != null) {
-                            consoleOutputCallback.accept(message);
-                        }
-                        functionName = libraryFunctionName;
+                        classNameMapping.put(className, "Libraries");
 
-                        // Store the mapping of original class name to "Libraries"
-                        synchronized (classNameMapping) {
-                            classNameMapping.put(className, "Libraries");
-                        }
+                        decompilationResults.add(new SQLiteDBHandler.DecompilationResult(
+                            libraryFunctionName, "Libraries", targetMacho.getMachoExecutableName(), targetMacho.getMachoExecutableName()));
 
-
-                        synchronized (decompilationResults) {
-                            decompilationResults.add(new SQLiteDBHandler.DecompilationResult(libraryFunctionName, "Libraries", targetMacho.getMachoExecutableName(), targetMacho.getMachoExecutableName()));
-                        }
-
-                        // Add to class functions map under "Libraries"
-                        synchronized (classToFunctions) {
-                            classToFunctions.computeIfAbsent("Libraries", k -> new JSONArray())
-                                            .put(libraryFunctionName);
-                        }
+                        JSONArray functions = classToFunctions.computeIfAbsent("Libraries", key -> new JSONArray());
+                        appendIfMissing(functions, libraryFunctionName);
                     }
-                });
 
-                ArrayList<SyntaxParser.TypeInfoResult> typeInfoResults = new ArrayList<>();
-                ArrayList<SyntaxParser.FunctionRefResult> functionRefResults = new ArrayList<>();
-                ArrayList<SyntaxParser.VariableRefResult> varRefs = new ArrayList<>();
-                for (SyntaxParser parser : syntaxParsers) {
-                    typeInfoResults.addAll(parser.getTypeInfoResults());
-                    functionRefResults.addAll(parser.getFunctionRefResults());
-                    varRefs.addAll(parser.getVariableRefResults());
+                    // Log progress every 100 functions and flush to DB every BATCH_SIZE
+                    int done = i + 1;
+                    if (done % 100 == 0 || done == totalFunctions) {
+                        String msg = "[" + done + "/" + totalFunctions + "] functions processed";
+                        LOGGER.info(msg);
+                        if (consoleOutputCallback != null) consoleOutputCallback.accept(msg);
+                    }
+                    if (done % BATCH_SIZE == 0) {
+                        dbHandler.insertFunctionDecompilations(decompilationResults);
+                        decompilationResults.clear();
+                    }
                 }
-                dbHandler.insertFunctionDecompilations(decompilationResults);
-                dbHandler.insertTypeInformations(typeInfoResults);
-                dbHandler.insertFunctionReferences(functionRefResults);
-                dbHandler.insertLocalVariableReferences(varRefs);
 
-                // Store class data for all classes (including libraries)
+                // Insert remaining
+                if (!decompilationResults.isEmpty()) {
+                    dbHandler.insertFunctionDecompilations(decompilationResults);
+                    decompilationResults.clear();
+                }
+                logBridgeMessage("Function processing complete: " + totalFunctions + " functions");
+
+                for (String originalLibraryClass : classNameMapping.keySet()) {
+                    classToFunctions.remove(originalLibraryClass);
+                }
+
                 for (Map.Entry<String, JSONArray> entry : classToFunctions.entrySet()) {
                     String className = entry.getKey();
                     JSONArray functions = entry.getValue();
                     LOGGER.info("Inserting class: " + className + " with " + functions.length() + " functions");
                     dbHandler.insertClass(className, functions.toString(), targetMacho.getMachoExecutableName());
                 }
+                commitPendingChanges("class metadata");
 
-                // Process string data
                 LOGGER.info("Processing " + stringData.length() + " strings from Ghidra analysis");
 
                 for (int i = 0; i < stringData.length(); i++) {
@@ -316,18 +254,158 @@ public class GhidraProject {
                     LOGGER.info("Inserting string: " + value + " at address: " + address);
                     dbHandler.insertMachoString(address, value, segment, label, targetMacho.getMachoExecutableName());
                 }
+                commitPendingChanges("Ghidra bridge import");
 
-                LOGGER.info("Finished processing all data");
+                logBridgeMessage("Finished processing all data");
             }
 
-            process.waitFor();
-            LOGGER.info("Ghidra analysis completed successfully");
+            int exitCode = process.waitFor();
+            outputThread.join(5_000);
+            if (exitCode != 0) {
+                throw new IOException("Ghidra headless analysis exited with code " + exitCode);
+            }
+            logBridgeMessage("Ghidra analysis completed successfully");
 
         } catch (Exception e) {
             LOGGER.log(Level.SEVERE, "Error during Ghidra decompilation", e);
             throw new RuntimeException("Ghidra decompilation failed: " + e.getMessage(), e);
         }
-    }    
+    }
+
+    static List<String> buildAnalyzeHeadlessCommand(
+            String analyzeHeadless,
+            String projectDirectoryPath,
+            String ghidraProjectName,
+            String executableFilePath,
+            String scriptPath,
+            int port,
+            String librariesArg) {
+        ArrayList<String> command = new ArrayList<>();
+        command.add(analyzeHeadless);
+        command.add(projectDirectoryPath);
+        command.add(ghidraProjectName);
+        command.add("-import");
+        command.add(executableFilePath);
+        command.add("-scriptPath");
+        command.add(scriptPath);
+        command.add("-deleteProject");
+        command.add("-postScript");
+        command.add("DumpClassData.java");
+        command.add(String.valueOf(port));
+        command.add(librariesArg);
+        return command;
+    }
+
+    static ServerSocket openBridgeServerSocket(int basePort, int maxPortAttempts) throws IOException {
+        return openBridgeServerSocket(basePort, maxPortAttempts, ServerSocket::new);
+    }
+
+    static ServerSocket openBridgeServerSocket(
+            int basePort,
+            int maxPortAttempts,
+            BridgeServerSocketFactory socketFactory) throws IOException {
+        int port = basePort;
+        int attempts = 0;
+
+        while (attempts < maxPortAttempts) {
+            try {
+                ServerSocket socket = socketFactory.create(port);
+                LOGGER.info("Successfully bound to port " + socket.getLocalPort());
+                return socket;
+            } catch (IOException e) {
+                LOGGER.warning("Port " + port + " is in use, trying next port");
+                port++;
+                attempts++;
+            }
+        }
+
+        ServerSocket socket = socketFactory.create(0);
+        LOGGER.info("Preferred bridge port range exhausted, using ephemeral port " + socket.getLocalPort());
+        return socket;
+    }
+
+    static String readDelimitedBlock(BufferedReader in, String endMarker, String sectionName) throws IOException {
+        StringBuilder dataBuilder = new StringBuilder();
+        String line;
+        while ((line = in.readLine()) != null) {
+            if (endMarker.equals(line)) {
+                return dataBuilder.toString();
+            }
+            dataBuilder.append(line).append("\n");
+        }
+        throw new IOException("Unexpected end of stream while reading " + sectionName + ". Missing marker " + endMarker);
+    }
+
+    static Map<String, JSONArray> extractClassFunctions(JSONArray classData) {
+        Map<String, JSONArray> classToFunctions = new HashMap<>();
+        for (int i = 0; i < classData.length(); i++) {
+            JSONObject classObject = classData.getJSONObject(i);
+            String className = classObject.optString("ClassName", "Global");
+            if (className == null || className.trim().isEmpty()) {
+                className = "Global";
+            }
+
+            JSONArray functions = classObject.optJSONArray("Functions");
+            JSONArray normalizedFunctions = new JSONArray();
+            if (functions != null) {
+                for (int functionIndex = 0; functionIndex < functions.length(); functionIndex++) {
+                    appendIfMissing(normalizedFunctions, functions.getString(functionIndex));
+                }
+            }
+            classToFunctions.put(className, normalizedFunctions);
+        }
+        return classToFunctions;
+    }
+
+    private static void appendIfMissing(JSONArray functions, String functionName) {
+        for (int i = 0; i < functions.length(); i++) {
+            if (functionName.equals(functions.getString(i))) {
+                return;
+            }
+        }
+        functions.put(functionName);
+    }
+
+    private static String readRequiredLine(BufferedReader in, String description) throws IOException {
+        String line = in.readLine();
+        if (line == null) {
+            throw new IOException("Unexpected end of stream while reading " + description);
+        }
+        return line;
+    }
+
+    private Socket acceptSocket(ServerSocket serverSocket, int timeoutMs, String phaseName) throws IOException {
+        serverSocket.setSoTimeout(timeoutMs);
+        try {
+            return serverSocket.accept();
+        } catch (SocketTimeoutException e) {
+            throw new IOException(
+                "Timed out waiting for Ghidra script " + phaseName + " connection after " + (timeoutMs / 1000) + " seconds",
+                e
+            );
+        }
+    }
+
+    private void logBridgeMessage(String message) {
+        LOGGER.info(message);
+        if (consoleOutputCallback != null) {
+            consoleOutputCallback.accept(message);
+        }
+    }
+
+    private void commitPendingChanges(String context) throws SQLException {
+        dbHandler.GetTransaction().commit();
+        LOGGER.info("Committed database transaction after " + context);
+    }
+
+    private static String getJarDirectory() {
+        try {
+            String jarPath = GhidraProject.class.getProtectionDomain().getCodeSource().getLocation().toURI().getPath();
+            return new File(jarPath).getParent();
+        } catch (Exception e) {
+            return System.getProperty("user.dir");
+        }
+    }
 
     private String getAnalyzeHeadlessPath() {
         String analyzeHeadless = Paths.get(config.getGhidraPath(), "support", "analyzeHeadless").toString();

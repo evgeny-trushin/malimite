@@ -19,8 +19,8 @@ public class GhidraProjectTest extends TestCase {
         List<String> command = GhidraProject.buildAnalyzeHeadlessCommand(
             "/opt/ghidra/support/analyzeHeadless",
             "/tmp/project",
-            "carsick_malimite",
-            "/tmp/project/carsick",
+            "test_malimite",
+            "/tmp/project/test",
             "/tmp/scripts",
             8765,
             "Foundation,UIKit"

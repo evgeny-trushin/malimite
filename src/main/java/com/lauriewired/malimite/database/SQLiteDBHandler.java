@@ -130,6 +130,15 @@ public class SQLiteDBHandler {
         }
     }
 
+    public boolean hasAnalysisData() {
+        try (Statement stmt = this.transaction.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM Functions")) {
+            return rs.next() && rs.getInt(1) > 0;
+        } catch (SQLException e) {
+            return false;
+        }
+    }
+
     public Connection GetTransaction() {
         return this.transaction;
     }
@@ -820,5 +829,42 @@ public class SQLiteDBHandler {
             LOGGER.log(Level.SEVERE, "Error getting main executable classes", e);
         }
         return classFunctionMap;
+    }
+
+    public Map<String, Map<String, String>> getAllDecompiledFunctions(String executableName) {
+        Map<String, Map<String, String>> classMap = new java.util.LinkedHashMap<>();
+        String sql = "SELECT ParentClass, FunctionName, DecompilationCode FROM Functions WHERE ExecutableName = ? ORDER BY ParentClass, FunctionName";
+
+        try (PreparedStatement pstmt = this.transaction.prepareStatement(sql)) {
+            pstmt.setString(1, executableName);
+            try (ResultSet rs = pstmt.executeQuery()) {
+                while (rs.next()) {
+                    String cls = rs.getString("ParentClass");
+                    String func = rs.getString("FunctionName");
+                    String code = rs.getString("DecompilationCode");
+                    classMap.computeIfAbsent(cls, k -> new java.util.LinkedHashMap<>()).put(func, code);
+                }
+            }
+        } catch (SQLException e) {
+            LOGGER.log(Level.SEVERE, "Error getting all decompiled functions", e);
+        }
+        return classMap;
+    }
+
+    public List<String[]> getAllStrings(String executableName) {
+        List<String[]> strings = new ArrayList<>();
+        String sql = "SELECT address, value, segment, label FROM MachoStrings WHERE ExecutableName = ? ORDER BY address";
+
+        try (PreparedStatement pstmt = this.transaction.prepareStatement(sql)) {
+            pstmt.setString(1, executableName);
+            try (ResultSet rs = pstmt.executeQuery()) {
+                while (rs.next()) {
+                    strings.add(new String[]{rs.getString("address"), rs.getString("value"), rs.getString("segment"), rs.getString("label")});
+                }
+            }
+        } catch (SQLException e) {
+            LOGGER.log(Level.SEVERE, "Error getting strings", e);
+        }
+        return strings;
     }
 }
