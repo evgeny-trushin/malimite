@@ -6,6 +6,7 @@ import javax.swing.JCheckBox;
 import javax.swing.JComboBox;
 import javax.swing.JDialog;
 import javax.swing.JEditorPane;
+import javax.swing.JFileChooser;
 import javax.swing.JFrame;
 import javax.swing.JLabel;
 import javax.swing.JList;
@@ -100,6 +101,16 @@ public class AnalysisWindow {
     private static JTree fileTree;
     private static Map<String, String> fileEntriesMap;
     private static String currentFilePath;
+    private static String architectureHint;
+    private static String pendingExportDir;
+
+    public static void setArchitectureHint(String hint) {
+        architectureHint = hint;
+    }
+
+    public static void setPendingExportDir(String dir) {
+        pendingExportDir = dir;
+    }
 
     private static SQLiteDBHandler dbHandler;
     private static GhidraProject ghidraProject;
@@ -180,6 +191,27 @@ public class AnalysisWindow {
             projectMacho = null;
             ghidraProject = null;
             config = null;  // Also reset the config
+        }
+    }
+
+    public static void exportProject(JFrame parentFrame) {
+        if (dbHandler == null || infoPlist == null) {
+            JOptionPane.showMessageDialog(parentFrame, "No analysis data available. Run analysis first.", "Export Error", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+
+        JFileChooser chooser = new JFileChooser();
+        chooser.setDialogTitle("Select Export Directory");
+        chooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
+        if (chooser.showSaveDialog(parentFrame) != JFileChooser.APPROVE_OPTION) return;
+
+        File exportDir = new File(chooser.getSelectedFile(), infoPlist.getExecutableName() + "_export");
+        try {
+            int count = com.lauriewired.malimite.utils.ProjectExporter.exportProject(dbHandler, infoPlist.getExecutableName(), exportDir);
+            JOptionPane.showMessageDialog(parentFrame, "Exported " + count + " files to:\n" + exportDir.getAbsolutePath(), "Export Complete", JOptionPane.INFORMATION_MESSAGE);
+        } catch (Exception e) {
+            LOGGER.log(Level.SEVERE, "Export failed", e);
+            JOptionPane.showMessageDialog(parentFrame, "Export failed: " + e.getMessage(), "Export Error", JOptionPane.ERROR_MESSAGE);
         }
     }
 
@@ -761,6 +793,7 @@ public class AnalysisWindow {
         LOGGER.info("Starting analysis on " + file.getName());
         fileNameLabel.setText(file.getName());
         filesRootNode.removeAllChildren();
+        classesRootNode.removeAllChildren();
         treeModel.reload();
         fileEntriesMap.clear();
         fileContentArea.setText("");
@@ -770,9 +803,12 @@ public class AnalysisWindow {
         if (FileProcessing.isArchiveFile(file)) {
             // Handle archive files (IPA, ZIP, etc.)
             unzipAndLoadToTree(file, filesRootNode, classesRootNode);
-        } else if (file.isDirectory() || file.getName().endsWith(".app")) {
+        } else if (file.isDirectory()) {
             // Handle directories and .app bundles
             loadDirectoryToTree(file, filesRootNode, classesRootNode);
+        } else if (FileProcessing.isMachOFile(file)) {
+            // Handle standalone Mach-O binaries (e.g. test.app that is a bare executable)
+            loadMachOFileToTree(file, filesRootNode, classesRootNode);
         } else {
             LOGGER.warning("Unsupported file type: " + file.getName());
             return;
@@ -831,7 +867,7 @@ public class AnalysisWindow {
         LOGGER.info("Loading directory: " + directory.getAbsolutePath());
         
         // Create app node if this is an .app bundle
-        DefaultMutableTreeNode appNode = directory.getName().endsWith(".app") ? 
+        DefaultMutableTreeNode appNode = directory.getName().toLowerCase().endsWith(".app") ?
             new DefaultMutableTreeNode(directory.getName()) : null;
         if (appNode != null) {
             filesRootNode.add(appNode);
@@ -863,6 +899,52 @@ public class AnalysisWindow {
         }
         
         treeModel.reload();
+    }
+
+    private static void loadMachOFileToTree(File file, DefaultMutableTreeNode filesRootNode, DefaultMutableTreeNode classesRootNode) {
+        LOGGER.info("Loading standalone Mach-O file: " + file.getAbsolutePath());
+
+        // Add the file as a node in the tree
+        DefaultMutableTreeNode fileNode = new DefaultMutableTreeNode(file.getName());
+        filesRootNode.add(fileNode);
+        fileEntriesMap.put(NodeOperations.buildFullPathFromNode(fileNode), file.getAbsolutePath());
+
+        // Use the file name as the executable name
+        String executableName = file.getName();
+        String baseName = executableName;
+        int lastDot = baseName.lastIndexOf('.');
+        if (lastDot > 0) {
+            baseName = baseName.substring(0, lastDot);
+        }
+
+        // Create an InfoPlist with the file name as the executable
+        infoPlist = new InfoPlist(executableName, baseName);
+        updateBundleIdDisplay(baseName);
+
+        // Initialize the project and populate classes
+        initializeProject();
+        populateClassesNode(classesRootNode);
+
+        treeModel.reload();
+
+        // Collapse all nodes first, then expand only the top-level classes node
+        NodeOperations.collapseAllTreeNodes(fileTree);
+        TreePath classesPath = new TreePath(treeModel.getPathToRoot(classesRootNode));
+        fileTree.expandPath(classesPath);
+        TreePath filesPath = new TreePath(new Object[]{treeModel.getRoot(), ((DefaultMutableTreeNode)treeModel.getRoot()).getChildAt(1)});
+        fileTree.expandPath(filesPath);
+
+        // Auto-export if --export was specified on CLI
+        if (pendingExportDir != null && dbHandler != null && infoPlist != null) {
+            try {
+                File exportDir = new File(pendingExportDir);
+                int count = com.lauriewired.malimite.utils.ProjectExporter.exportProject(dbHandler, infoPlist.getExecutableName(), exportDir);
+                LOGGER.info("CLI export complete: " + count + " files to " + exportDir.getAbsolutePath());
+            } catch (Exception e) {
+                LOGGER.log(Level.SEVERE, "CLI export failed", e);
+            }
+            pendingExportDir = null;
+        }
     }
 
     private static DefaultMutableTreeNode findInfoPlistWithBundleId(File directory, DefaultMutableTreeNode rootNode) {
@@ -1011,47 +1093,109 @@ public class AnalysisWindow {
     }
     
     private static void populateClassesNode(DefaultMutableTreeNode classesRootNode) {
+        classesRootNode.removeAllChildren();
         Map<String, List<String>> classesAndFunctions = dbHandler.getMainExecutableClasses(infoPlist.getExecutableName());
-        
+
+        LOGGER.info("Populating classes tree: " + classesAndFunctions.size() + " classes");
+
         // Convert map keys to sorted list
         List<String> sortedClassNames = new ArrayList<>(classesAndFunctions.keySet());
-        
-        // Remove "Libraries" from the list if it exists
         sortedClassNames.remove("Libraries");
-        
-        // Sort remaining class names
         Collections.sort(sortedClassNames);
-        
-        // Add "Libraries" first if it exists in the original map
+
+        // Add "Libraries" first if it exists
         if (classesAndFunctions.containsKey("Libraries")) {
-            DefaultMutableTreeNode librariesNode = new DefaultMutableTreeNode("Libraries");
-            List<String> libraryFunctions = classesAndFunctions.get("Libraries");
-            if (libraryFunctions != null) {
-                Collections.sort(libraryFunctions);
-                for (String function : libraryFunctions) {
-                    librariesNode.add(new DefaultMutableTreeNode(function));
-                }
-            }
+            DefaultMutableTreeNode librariesNode = new DefaultMutableTreeNode("Libraries (" + classesAndFunctions.get("Libraries").size() + ")");
+            // Don't add individual library functions to tree — too many, load on demand
             classesRootNode.add(librariesNode);
         }
-        
+
         // Add remaining classes in sorted order
         for (String className : sortedClassNames) {
             DefaultMutableTreeNode classNode = new DefaultMutableTreeNode(className);
             List<String> functions = classesAndFunctions.get(className);
-            
-            // Sort functions alphabetically if they exist
             if (functions != null) {
                 Collections.sort(functions);
                 for (String function : functions) {
                     classNode.add(new DefaultMutableTreeNode(function));
                 }
             }
-            
             classesRootNode.add(classNode);
         }
-        
+
+        LOGGER.info("Classes tree built with " + sortedClassNames.size() + " non-library classes");
         treeModel.reload(classesRootNode);
+    }
+
+    static DefaultMutableTreeNode findPreferredAnalysisNode(
+            DefaultMutableTreeNode classesRootNode,
+            DefaultMutableTreeNode fallbackNode) {
+        if (classesRootNode == null || classesRootNode.getChildCount() == 0) {
+            return fallbackNode;
+        }
+
+        DefaultMutableTreeNode librariesNode = null;
+        DefaultMutableTreeNode nonLibraryClassWithoutFunctions = null;
+
+        Enumeration<?> children = classesRootNode.children();
+        while (children.hasMoreElements()) {
+            DefaultMutableTreeNode classNode = (DefaultMutableTreeNode) children.nextElement();
+            if ("Libraries".equals(classNode.getUserObject().toString())) {
+                librariesNode = classNode;
+                continue;
+            }
+
+            if (classNode.getChildCount() > 0) {
+                return (DefaultMutableTreeNode) classNode.getFirstChild();
+            }
+
+            if (nonLibraryClassWithoutFunctions == null) {
+                nonLibraryClassWithoutFunctions = classNode;
+            }
+        }
+
+        if (nonLibraryClassWithoutFunctions != null) {
+            return nonLibraryClassWithoutFunctions;
+        }
+
+        if (librariesNode == null) {
+            return fallbackNode;
+        }
+
+        if (librariesNode.getChildCount() > 0) {
+            return (DefaultMutableTreeNode) librariesNode.getFirstChild();
+        }
+
+        return librariesNode;
+    }
+
+    private static void selectInitialAnalysisNode(
+            DefaultMutableTreeNode classesRootNode,
+            DefaultMutableTreeNode fallbackNode) {
+        DefaultMutableTreeNode preferredNode = findPreferredAnalysisNode(classesRootNode, fallbackNode);
+        if (preferredNode == null) {
+            return;
+        }
+
+        TreePath preferredPath = new TreePath(treeModel.getPathToRoot(preferredNode));
+        fileTree.setSelectionPath(preferredPath);
+        fileTree.scrollPathToVisible(preferredPath);
+        SelectFile.addFile(preferredPath);
+    }
+
+    static boolean shouldDisplayBinaryPlaceholder(File sourceFile, String entryPath) {
+        if (sourceFile == null || entryPath == null || FileProcessing.isArchiveFile(sourceFile)) {
+            return false;
+        }
+
+        File entryFile = new File(entryPath);
+        return entryFile.isFile() && FileProcessing.isMachOFile(entryFile);
+    }
+
+    private static String buildBinaryPlaceholderMessage(String entryPath) {
+        String fileName = new File(entryPath).getName();
+        return "Binary Mach-O file: " + fileName + "\n\n"
+            + "Use the Classes tree to inspect decompiled code instead of the raw executable bytes.";
     }
 
     private static void initializeProject() {
@@ -1132,7 +1276,27 @@ public class AnalysisWindow {
                 LOGGER.info("Checking for database at: " + dbFilePath);
 
                 File dbFile = new File(dbFilePath);
-                if (!dbFile.exists()) {
+                boolean needsAnalysis = !dbFile.exists();
+                if (!needsAnalysis) {
+                    // DB file exists — check if it actually has data
+                    try (java.sql.Connection checkConn = java.sql.DriverManager.getConnection("jdbc:sqlite:" + dbFilePath);
+                         java.sql.Statement checkStmt = checkConn.createStatement();
+                         java.sql.ResultSet checkRs = checkStmt.executeQuery("SELECT COUNT(*) FROM Functions")) {
+                        if (!checkRs.next() || checkRs.getInt(1) == 0) {
+                            LOGGER.warning("Database exists but is empty, re-running Ghidra analysis");
+                            needsAnalysis = true;
+                            dbFile.delete();
+                            // Also delete WAL/SHM files
+                            new File(dbFilePath + "-wal").delete();
+                            new File(dbFilePath + "-shm").delete();
+                        }
+                    } catch (Exception e) {
+                        LOGGER.warning("Could not verify database, re-running analysis: " + e.getMessage());
+                        needsAnalysis = true;
+                        dbFile.delete();
+                    }
+                }
+                if (needsAnalysis) {
                     if (projectMacho.isUniversalBinary()) {
                         LOGGER.info("Detected universal binary - preparing to handle architecture selection");
                         final String[] selectedArch = new String[1];
@@ -1240,8 +1404,27 @@ public class AnalysisWindow {
     }
 
     private static String selectArchitecture(List<String> architectures) {
+        // Check for CLI architecture hint
+        if (architectureHint != null) {
+            String hint = architectureHint.toLowerCase();
+            for (String arch : architectures) {
+                String archLower = arch.toLowerCase();
+                if (archLower.contains(hint) ||
+                    (hint.equals("arm64") && archLower.contains("arm64")) ||
+                    (hint.equals("x86_64") && archLower.contains("x86_64")) ||
+                    (hint.equals("x86") && archLower.contains("x86"))) {
+                    LOGGER.info("Auto-selected architecture from CLI hint '" + architectureHint + "': " + arch);
+                    architectureHint = null; // Clear after use
+                    return arch;
+                }
+            }
+            LOGGER.warning("CLI architecture hint '" + architectureHint + "' did not match any available architecture");
+            architectureHint = null;
+        }
+
+        // Fall back to GUI dialog
         JComboBox<String> architectureComboBox = new JComboBox<>(architectures.toArray(new String[0]));
-        int result = JOptionPane.showConfirmDialog(null, architectureComboBox, "Select Architecture", 
+        int result = JOptionPane.showConfirmDialog(null, architectureComboBox, "Select Architecture",
                                                     JOptionPane.OK_CANCEL_OPTION, JOptionPane.QUESTION_MESSAGE);
         if (result == JOptionPane.OK_OPTION) {
             return (String) architectureComboBox.getSelectedItem();
@@ -1451,6 +1634,13 @@ public class AnalysisWindow {
                     // Handle archive files (IPA, ZIP, etc.)
                     contentBytes = FileProcessing.readContentFromZip(currentFilePath, entryPath);
                 } else {
+                    if (shouldDisplayBinaryPlaceholder(file, entryPath)) {
+                        fileContentArea.setSyntaxEditingStyle(SyntaxConstants.SYNTAX_STYLE_NONE);
+                        fileContentArea.setText(buildBinaryPlaceholderMessage(entryPath));
+                        fileContentArea.setCaretPosition(0);
+                        return;
+                    }
+
                     // Handle directories and .app bundles - read file directly
                     contentBytes = Files.readAllBytes(new File(entryPath).toPath());
                 }

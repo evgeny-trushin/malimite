@@ -21,7 +21,7 @@ public class AnalysisWindowTest extends TestCase {
         appClassNode.add(appFunctionNode);
         classesRootNode.add(appClassNode);
 
-        DefaultMutableTreeNode fallbackFileNode = new DefaultMutableTreeNode("carsick.app");
+        DefaultMutableTreeNode fallbackFileNode = new DefaultMutableTreeNode("test.app");
 
         DefaultMutableTreeNode preferredNode = AnalysisWindow.findPreferredAnalysisNode(
             classesRootNode,

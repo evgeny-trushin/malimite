@@ -50,9 +50,16 @@ public class SyntaxParser {
         }
     }
 
+    private static final int MAX_CODE_LENGTH_FOR_PARSING = 50_000; // Skip ANTLR parsing for very large functions
+
     public void collectCrossReferences(String formattedCode) {
         if (currentFunction == null || currentClass == null) {
             LOGGER.warning("Cannot collect cross-references: missing context");
+            return;
+        }
+
+        if (formattedCode.length() > MAX_CODE_LENGTH_FOR_PARSING) {
+            LOGGER.info("Skipping syntax parsing for " + currentClass + "::" + currentFunction + " (code too large: " + formattedCode.length() + " chars)");
             return;
         }
 
@@ -72,7 +79,7 @@ public class SyntaxParser {
 
             new CrossReferenceVisitor().visit(tree);
         } catch (Exception e) {
-            LOGGER.log(Level.SEVERE, "Error collecting cross-references", e);
+            LOGGER.log(Level.WARNING, "Error collecting cross-references for " + currentClass + "::" + currentFunction, e);
         }
     }
 
