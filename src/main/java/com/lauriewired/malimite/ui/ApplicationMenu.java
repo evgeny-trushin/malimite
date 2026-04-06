@@ -65,6 +65,12 @@ public class ApplicationMenu {
             }
         }, KeyStroke.getKeyStroke(KeyEvent.VK_E, KeyEvent.CTRL_DOWN_MASK));
 
+        fileMenu.addSeparator();
+
+        addMenuItem(fileMenu, "Export Decompilation...", e -> {
+            AnalysisWindow.exportProject(parentFrame);
+        }, KeyStroke.getKeyStroke(KeyEvent.VK_E, KeyEvent.CTRL_DOWN_MASK | KeyEvent.SHIFT_DOWN_MASK));
+
         return fileMenu;
     }
 

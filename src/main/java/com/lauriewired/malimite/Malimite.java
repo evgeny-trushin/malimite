@@ -51,10 +51,10 @@ public class Malimite {
 
         FlatLaf.setUseNativeWindowDecorations(true);
     
-        SwingUtilities.invokeLater(() -> createAndShowGUI(config));
+        SwingUtilities.invokeLater(() -> createAndShowGUI(config, args));
     }
 
-    private static void createAndShowGUI(Config config) {
+    private static void createAndShowGUI(Config config, String[] args) {
         SafeMenuAction.execute(() -> {
             JFrame frame = new JFrame("Malimite");
             
@@ -93,6 +93,41 @@ public class Malimite {
             setupComponents(panel, frame, config);
         
             frame.setVisible(true);
+
+            // Auto-open file if path provided as CLI argument
+            // Usage: malimite [--arch arm64|x86_64] [--export <dir>] <file>
+            if (args.length > 0) {
+                String archHint = null;
+                String filePath = null;
+                String exportDir = null;
+
+                for (int i = 0; i < args.length; i++) {
+                    if ("--arch".equals(args[i]) && i + 1 < args.length) {
+                        archHint = args[++i];
+                    } else if ("--export".equals(args[i]) && i + 1 < args.length) {
+                        exportDir = args[++i];
+                    } else if (!args[i].startsWith("--")) {
+                        filePath = args[i];
+                    }
+                }
+
+                if (filePath != null) {
+                    File cliFile = new File(filePath);
+                    if (cliFile.exists()) {
+                        LOGGER.info("Auto-opening file from CLI argument: " + cliFile.getAbsolutePath());
+                        if (archHint != null) {
+                            LOGGER.info("Architecture hint from CLI: " + archHint);
+                            AnalysisWindow.setArchitectureHint(archHint);
+                        }
+                        if (exportDir != null) {
+                            AnalysisWindow.setPendingExportDir(exportDir);
+                        }
+                        AnalysisWindow.show(cliFile, config);
+                    } else {
+                        LOGGER.warning("CLI argument file not found: " + filePath);
+                    }
+                }
+            }
         });
     }
     
