@@ -51,3 +51,11 @@ hs_err_pid*.log
 # Ignore local configuration file
 malimite.properties
 malimite.projects
+
+# Ghidra installation (downloaded/extracted by run_ghidra.sh)
+ghidra_dist/
+ghidra_downloads/
+
+# Analysis output
+*_malimite/
+*_export/
