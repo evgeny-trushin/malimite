@@ -9,6 +9,7 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.RandomAccessFile;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 import com.google.gson.Gson;
@@ -166,23 +167,17 @@ public class FileProcessing {
                     } else {
                         LOGGER.warning("No executable name provided for archive file");
                     }
-                } else if (inputFile.isDirectory() || inputFile.getName().endsWith(".app")) {
+                } else if (inputFile.isDirectory()) {
                     // Handle directories and .app bundles
                     // Find the executable in the directory
-                    File[] files = inputFile.listFiles();
-                    if (files != null) {
-                        for (File file : files) {
-                            if (file.getName().equals(executableName)) {
-                                // Copy the executable to the project directory
-                                String outputFilePath = projectDirectoryPath + File.separator + executableName;
-                                try {
-                                    Files.copy(file.toPath(), new File(outputFilePath).toPath());
-                                    LOGGER.info("Copied executable to: " + outputFilePath);
-                                } catch (IOException e) {
-                                    LOGGER.log(Level.SEVERE, "Error copying executable", e);
-                                }
-                                break;
-                            }
+                    File found = findFileInDirectory(inputFile, executableName);
+                    if (found != null) {
+                        String outputFilePath = projectDirectoryPath + File.separator + executableName;
+                        try {
+                            Files.copy(found.toPath(), new File(outputFilePath).toPath());
+                            LOGGER.info("Copied executable to: " + outputFilePath);
+                        } catch (IOException e) {
+                            LOGGER.log(Level.SEVERE, "Error copying executable", e);
                         }
                     }
                 }
@@ -197,6 +192,51 @@ public class FileProcessing {
                 LOGGER.info("Loaded existing project: " + project.getFileName());
             }
         }
+
+        // Always ensure the executable exists in the project directory
+        ensureExecutableInProject(filePath, projectDirectoryPath, executableName);
+    }
+
+    private static void ensureExecutableInProject(String filePath, String projectDirectoryPath, String executableName) {
+        if (executableName == null || executableName.isEmpty()) return;
+
+        File executableInProject = new File(projectDirectoryPath + File.separator + executableName);
+        if (executableInProject.exists()) return;
+
+        LOGGER.info("Executable missing from project, copying: " + executableName);
+        File inputFile = new File(filePath);
+
+        try {
+            if (isArchiveFile(inputFile)) {
+                unzipExecutable(filePath, executableName, executableInProject.getAbsolutePath());
+            } else if (inputFile.isDirectory()) {
+                // Search for the executable inside the directory tree
+                File found = findFileInDirectory(inputFile, executableName);
+                if (found != null) {
+                    Files.copy(found.toPath(), executableInProject.toPath());
+                    LOGGER.info("Copied executable from directory to: " + executableInProject);
+                }
+            } else if (inputFile.isFile()) {
+                // Standalone binary (Mach-O or otherwise) — copy it directly
+                Files.copy(inputFile.toPath(), executableInProject.toPath());
+                LOGGER.info("Copied standalone executable to: " + executableInProject);
+            }
+        } catch (IOException e) {
+            LOGGER.log(Level.SEVERE, "Error copying executable into project", e);
+        }
+    }
+
+    private static File findFileInDirectory(File directory, String name) {
+        File[] files = directory.listFiles();
+        if (files == null) return null;
+        for (File f : files) {
+            if (f.getName().equals(name)) return f;
+            if (f.isDirectory()) {
+                File found = findFileInDirectory(f, name);
+                if (found != null) return found;
+            }
+        }
+        return null;
     }
 
     private static Project loadProjectConfig(String projectDirectoryPath) {
@@ -213,11 +253,23 @@ public class FileProcessing {
 
     public static boolean isArchiveFile(File file) {
         String name = file.getName().toLowerCase();
-        return name.endsWith(".ipa") || 
-               name.endsWith(".zip") || 
-               name.endsWith(".tar") || 
+        return name.endsWith(".ipa") ||
+               name.endsWith(".zip") ||
+               name.endsWith(".tar") ||
                name.endsWith(".gz") ||
                name.endsWith(".7z");
+    }
+
+    public static boolean isMachOFile(File file) {
+        if (!file.isFile() || file.length() < 4) return false;
+        try (RandomAccessFile raf = new RandomAccessFile(file, "r")) {
+            int magic = raf.readInt();
+            return magic == 0xFEEDFACE || magic == 0xFEEDFACF ||  // Mach-O 32/64
+                   magic == 0xCEFAEDFE || magic == 0xCFFAEDFE ||  // Mach-O reversed
+                   magic == 0xCAFEBABE || magic == 0xBEBAFECA;     // Universal binary
+        } catch (IOException e) {
+            return false;
+        }
     }
 
     private static void addProjectToList(String projectPath) {

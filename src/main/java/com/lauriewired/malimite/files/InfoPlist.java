@@ -53,6 +53,11 @@ public class InfoPlist {
         this.bundleIdentifier = "unknown";
     }
 
+    public InfoPlist(String executableName, String bundleIdentifier) {
+        this.infoPlistBundleExecutable = executableName;
+        this.bundleIdentifier = bundleIdentifier;
+    }
+
     public static InfoPlist createEmpty() {
         return new InfoPlist();
     }
