@@ -84,8 +84,11 @@ fi
 
 # Build java arguments
 JAVA_ARGS=()
-[[ -n "${ARCH}" ]]   && JAVA_ARGS+=(--arch "${ARCH}")
-[[ -n "${EXPORT}" ]] && JAVA_ARGS+=(--export "$(cd "$(dirname "${EXPORT}")" 2>/dev/null && pwd)/$(basename "${EXPORT}")" 2>/dev/null || JAVA_ARGS+=(--export "${EXPORT}"))
+[[ -n "${ARCH}" ]] && JAVA_ARGS+=(--arch "${ARCH}")
+if [[ -n "${EXPORT}" ]]; then
+    EXPORT_ABS="$(cd "$(dirname "${EXPORT}")" 2>/dev/null && pwd)/$(basename "${EXPORT}")" 2>/dev/null || EXPORT_ABS="${EXPORT}"
+    JAVA_ARGS+=(--export "${EXPORT_ABS}")
+fi
 JAVA_ARGS+=("${BINARY}")
 
 cd "${TARGET_DIR}" && exec java "-Xmx${HEAP}" -jar "${JAR}" "${JAVA_ARGS[@]}"
